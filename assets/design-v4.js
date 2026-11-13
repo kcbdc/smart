@@ -1,0 +1,9 @@
+/* Progressive navigation enhancement. Uses original v3 data-view handlers; no replacement of academic logic. */
+(() => {
+ const menu = document.querySelector('#nav');
+ const dock = document.querySelector('.mobile-dock');
+ const labels = {ko:{quick:'QUICK ACCESS · 자주 찾는 서비스',journey:'나만의 속도로, 꾸준히 성장하는 오늘.',journeyDesc:'강의를 이어 듣고 학습 목표를 달성해 보세요.'},en:{quick:'QUICK ACCESS · Essential services',journey:'Every step forward is progress.',journeyDesc:'Resume your lessons and reach your weekly goals.'},zh:{quick:'快捷入口 · 常用服务',journey:'按照自己的节奏，稳步成长。',journeyDesc:'继续学习课程，实现本周目标。'},vi:{quick:'TRUY CẬP NHANH · Dịch vụ',journey:'Tiến bộ mỗi ngày theo nhịp độ của bạn.',journeyDesc:'Tiếp tục bài học và hoàn thành mục tiêu tuần này.'}};
+ function sync(){const active=menu?.querySelector('button.active')?.dataset.view||'portal';dock?.querySelectorAll('button').forEach(btn=>{const yes=btn.dataset.mobileView===active;btn.classList.toggle('active',yes);if(yes)btn.setAttribute('aria-current','page');else btn.removeAttribute('aria-current');}); const lang=document.querySelector('#lang')?.value||'ko';const dict=labels[lang]||labels.ko;document.querySelectorAll('[data-v4-i18n]').forEach(el=>{el.textContent=dict[el.dataset.v4I18n]||''});}
+ dock?.addEventListener('click',e=>{const b=e.target.closest('[data-mobile-view]');if(!b)return;const original=menu?.querySelector(`[data-view="${b.dataset.mobileView}"]`);original?.click();sync();window.scrollTo({top:0,behavior:'smooth'});});
+ menu?.addEventListener('click',()=>queueMicrotask(sync));document.querySelector('#lang')?.addEventListener('change',()=>queueMicrotask(sync));document.querySelectorAll('[data-go]').forEach(el=>el.addEventListener('click',()=>queueMicrotask(sync)));new MutationObserver(sync).observe(menu||document.body,{attributes:true,subtree:true,attributeFilter:['class']});sync();
+})();
