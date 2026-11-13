@@ -1,94 +1,55 @@
-# SMART CYBER UNIVERSITY — Campus OS v6
+# SMART CYBER UNIVERSITY — 통합 프로토타입 v2
 
-**Status: integration/security verification build, NOT authorized for live institutional records or public launch.**
+기존 대학 포털/LMS/학사행정/AI 튜터 디자인을 유지하면서 SQLite·세션 로그인·권한별 화면·동영상 재생·교안 검색 API를 추가한 **로컬 시연용** 프로젝트입니다.
 
-v5 visual system and role-based LMS workflows have been retained. v6 introduces infrastructure-ready components and testable integration contracts for OIDC SSO, MFA assurance, HTTPS deployment, attendance-policy versioning, SIS signed webhooks/outbox, CSRF/session protections, and regression testing.
+## 시작
 
-## 1. Run local demonstration
-
-Python 3.11+:
+Python 3.10 이상 설치 후 터미널에서 프로젝트 폴더로 이동합니다.
 
 ```bash
 python server.py
 ```
 
-Open `http://127.0.0.1:8765`. Only in `SCU_MODE=demo`: student/student123!, professor/professor123!, admin/admin123!. All demo credentials, course data, academic status, and video are synthetic. **Never run demo mode publicly.**
+브라우저에서 `http://127.0.0.1:8765` 접속. **`index.html`을 직접 여는 경우**에는 서버 기능 없이 이전과 같은 단독 프런트엔드 시연 모드로 작동합니다.
+
+## 시연 계정 (실제 운영에서 절대 사용 금지)
+
+| 역할 | ID | 암호 | 시연 기능 |
+|---|---|---|---|
+| 학생 | `student` | `student123!` | 학습 진도/수강 신청 DB 저장, 강의 재생, 교안 기반 튜터 |
+| 교수자 | `professor` | `professor123!` | 학생별 완료 차시·신청 과목 수 집계 |
+| 관리자 | `admin` | `admin123!` | 학습 현황 및 최근 감사 로그 |
+
+학생 계정으로 로그인한 다음 강의실의 재생 버튼을 클릭하면 자체 제작 15초 강의 샘플을 재생합니다. 끝까지 재생되면 완료 차시가 SQLite에 기록됩니다. 학사행정에서 수강신청 또는 증명서 미리보기를 이용하면 같은 계정의 DB에 시연 기록이 저장됩니다.
+
+AI 튜터는 서버 내 `CORPUS` 목록의 **실제 포함된 텍스트**에서 질문과 관련된 문장을 검색해 출처 제목과 함께 응답합니다. `OPENAI_API_KEY`가 서버 환경변수에 있을 때만 선택적으로 Responses API를 호출하여 검색 근거를 요약합니다. API 연결 실패 시 검색형 응답으로 돌아갑니다. 어떤 방식도 실제 대학 학사 규정의 권위 있는 판단으로 사용해서는 안 됩니다.
 
 ```bash
-python -m unittest test_v5 test_v6 -v
-```
-
-## 2. SSO / MFA: configured enterprise IdP required
-
-Production requires an institution-owned OIDC Identity Provider using *authorization code + PKCE S256*. `/auth/start` initiates an OIDC login; `/auth/callback` validates a one-use, browser-bound state, nonce, issuer, audience, signature via JWKS, token expiry, authorized campus role, and IdP MFA assertion (`amr` or campus-approved `acr`). Missing/weak MFA assurance is rejected; no local fallback login exists in production. Allowed role claim values: `student`, `professor`, `admin`. `iss|sub` is the internal immutable identity; SIS should map this identifier to a student identifier rather than rely on a display name.
-
-Install requirements and configure a secure reverse proxy as in deployment files:
-
-```bash
-python -m pip install -r requirements-production.txt
-# Export production.env.example values through secret manager; do not execute placeholder config.
+# 선택 사항: 외부 AI를 이용할 때에만 설정
+export OPENAI_API_KEY="YOUR_API_KEY"
+export SCU_AI_MODEL="gpt-4.1-mini"
 python server.py
 ```
 
-The server only binds `127.0.0.1`. Direct HTTP in production is denied, and requests must arrive through the trusted localhost TLS terminator setting `X-Forwarded-Proto: https`. **Production fails at startup** without HTTPS public URL, IdP issuer/client ID, explicit proxy trust flag, persistent CSRF secret, and runtime auth dependencies. Proxy sample is not a substitute for infrastructure penetration testing or certificate issuance.
+## 데이터 및 보안 한계
 
-The sample is a single-machine Python stdlib server + SQLite. For multi-node or large-enrollment operation, replace this service and DB with hardened app server, shared session store, managed HA database, queue processing, observability and backups.
+- `campus_demo.sqlite3` 파일은 실행 시 생성되며, 저장된 데이터는 브라우저가 아니라 서버 SQLite에 보관됩니다. 초기화하려면 서버를 종료한 뒤 해당 파일을 삭제합니다.
+- 테스트용 계정 비밀번호는 문서에 공개되어 있습니다. 로컬 `127.0.0.1`에만 바인딩되며 외부 배포용 구성이 아닙니다.
+- 세션 토큰은 서버 메모리에 저장되어 재시작 시 로그아웃됩니다. 쿠키는 HttpOnly/SameSite=Strict 속성을 사용하지만, 실제 배포에는 HTTPS Secure 쿠키, 계정 관리, CSRF 방어, 비밀번호 변경, RBAC 보강, 테스트, 암호화 및 감사 정책이 필요합니다.
+- 예시 강의 영상은 실제 강좌가 아닌 자체 제작 15초 시연 미디어입니다. 영상 시청 완료는 공식 출석으로 인정되지 않습니다.
+- 입력된 진도/신청/증명서는 모두 가상 데이터입니다. 실제 교무·등록금·인증·증명서·DRM·동영상 CDN 연계는 추가 개발이 필요합니다.
+- 학습 통계/감사 로그는 역할 기반으로 API 접근을 제한하지만, 실제 개인정보 처리를 위한 심층 보안검토 전에는 사용하지 마세요.
 
-## 3. Session and request security
+## 파일 구조
 
-- Random 256-bit login tokens stored as SHA-256 digests in SQLite (not plaintext); logout revokes DB session.
-- Session absolute expiry 4 hours, inactivity expiry 30 minutes.
-- Production `__Host-` Secure HttpOnly SameSite=Lax cookie, HSTS and response protections.
-- CSRF token from `/api/me` or login, sent by browser as `X-CSRF-Token` for state-changing APIs. SIS webhook uses independent HMAC signature/timestamp instead.
-- Local password login disabled in production. Demo password auth remains strictly local and for testing only.
-- OIDC MFA verification depends on actual institution IdP's documented `amr` / `acr` semantics; must be tested against live test users, including MFA failure cases.
-- **Known gaps:** no enterprise user lifecycle / SCIM deprovisioning, central secret rotation, enterprise SOC logging, tamper-evident audit storage, IP-level network rate limits for all endpoints, complete WebAuthn step-up, or security certification. No production claim should be inferred.
+- `index.html`: 반응형 4개국어/시니어 모드 UI, 역할 전환 시연
+- `server.py`: Python 표준 라이브러리 기반 HTTP 서버, SQLite DB, 로그인, 학습 API, 검색형 튜터
+- `assets/sample-lecture.mp4`: 자체 생성된 15초 테스트용 강의 영상
 
-## 4. Attendance standards: per-term and per-course policy
+## API 간단 명세
 
-`attendance_policies` stores term, course or `*`, rule JSON, version, effective time, approver. In demo a synthetic `DEMO-1` policy permits 12/15 seconds and 80% threshold. Production does **not** seed any attendance rules. Requests to start a lesson without an approved policy are rejected. Rule is snapshotted at the beginning of a video session to avoid retroactive silent changes, and recognized attendance stores a policy version.
-
-Authorized admin can publish a policy via `POST /api/v6/policy`:
-
-```json
-{"term":"2026-2","course":"AI101","version":"REG-2026-2-01","rule":{"min_watch_ratio":0.9,"min_watch_seconds":14,"require_ended":true,"heartbeat_grace_seconds":0.5,"max_speed":1.0}}
-```
-
-Rules are **examples only**, not an interpretation of a real university's academic regulations. Real policy review must address lesson lengths, make-up classes, exceptions, holidays, accessibility accommodations, clock accuracy, appeal/override auditing, and the legal basis for tracking. Browser video-heartbeat evidence cannot conclusively establish a human watched the lecture, so official attendance requires additional anti-abuse controls and/or institutional acceptance.
-
-## 5. SIS integration contract (NOT a live SIS integration)
-
-`POST /api/sis/webhook`: independent signed payload `X-SIS-Timestamp` (Unix seconds) and `X-SIS-Signature: sha256=<hex>` where HMAC-SHA256 covers `timestamp + '.' + raw_body`. Rejects replayed timestamps more than 5 minutes away, changes to duplicate event IDs, unauthorized signatures, invalid terms/rosters. Event examples:
-
-```json
-{"event_id":"evt-2026-0001","event_type":"student.upsert","data":{"subject":"https://sso.example.edu/realms/campus|123","student_id":"S123456","program":"ICT","standing":"enrolled"}}
-```
-```json
-{"event_id":"evt-2026-0002","event_type":"enrollment.upsert","data":{"subject":"https://sso.example.edu/realms/campus|123","student_id":"S123456","term":"2026-2","course":"AI101","enrolled":true}}
-```
-
-Event types: `student.upsert`, `student.status`, `enrollment.upsert`. SIS is authoritative for student roster and standing in the intended deployment. This pilot accepts only demonstration term `2026-2` and currently configured courses; real schema and mapping will need to be agreed with university SIS owners. Administrator academic decisions are saved to `sis_outbox` for reliable delivery, **not applied to an authoritative SIS until the SIS confirms them**. `python sis_worker.py` attempts signed HTTPS delivery to preconfigured endpoint. Production needs a scheduled worker, retry/dead-letter policy, acknowledgments, and reconciliation dashboard. Never use demonstration identifiers as real student data.
-
-## 6. Security acceptance tasks before any public launch
-
-1. Obtain and test actual IdP discovery URL, MFA claims, authorization scopes, logout/deprovisioning, and role-assignment governance.
-2. Issue valid public TLS certificates and verify end-to-end HTTPS, proxy restrictions, HSTS and certificate renewal.
-3. Receive signed regulator/institution-approved attendance policy and perform exception/appeal tests.
-4. Sign and test SIS API schema with owners: enrollment changes, student status, idempotency, retries, errors and reconciliation.
-5. Independent penetration testing and OWASP ASVS-based review (authorization/IDOR, CSRF, XSS, SSRF, injection, replay, rate limiting), data protection impact review, backups/restores, disaster recovery, load tests.
-6. Replace demonstration runtime before scale; log operational events to tamper-resistant centralized logging; secure PII and retention rules.
-
-## 7. Source map
-
-- `server.py`: API gateway/auth routing and role checks
-- `security.py`: OIDC verification, session/cookie/CSRF safeguards
-- `attendance_rules.py` + `academic.py`: versioned attendance and video session evidence
-- `sis.py`, `sis_worker.py`: signed inbound SIS updates and outbound retry queue
-- `operations.py`: professor content and admin workflows
-- `deployment/nginx.example.conf`, `deployment/production.env.example`: TLS and IdP provisioning templates
-- `test_v5.py`, `test_v6.py`: functional and security regression tests
-- `assets/`: original v5 responsive UI and training video
-
-### Important operational note
-
-This is a working reference implementation with explicit external integration boundaries. It is **not yet a compliant, accredited, secure production university platform**: the institutional IdP, SIS, privacy/records policies, and hosting infrastructure must be jointly configured and validated by university operators.
+- `GET /api/health`: 상태
+- `POST /api/login`, `POST /api/logout`, `GET /api/me`: 사용자 인증
+- `GET/POST /api/state`: 학생 본인 기록 저장/조회
+- `GET /api/stats`: 교수자 또는 관리자 학생 요약
+- `POST /api/tutor`: 강의 내용/FAQ 검색형 질의응답

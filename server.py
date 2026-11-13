@@ -1,247 +1,147 @@
-"""SMART CYBER UNIVERSITY — v5 local validation server (NOT production-ready).
-Uses Python stdlib + SQLite; all identities, approvals and attendance are DEMO only.
-"""
-import os, json, time, sqlite3, secrets, hashlib, hmac, mimetypes, threading
+"""Smart Cyber University demo server: stdlib-only, local development ONLY."""
+import json, os, sqlite3, secrets, hashlib, hmac, time, mimetypes, urllib.request
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from http.cookies import SimpleCookie
-from urllib.parse import urlparse, parse_qs
-import academic, operations, security, sis, attendance_rules
+from urllib.parse import urlparse
 
 ROOT=Path(__file__).resolve().parent
-DB=Path(os.getenv('SCU_DB',ROOT/'campus_demo.sqlite3'))
+DB=Path(os.getenv('SCU_DB', ROOT/'campus_demo.sqlite3'))
 SESSIONS={}
-LOGIN_FAILURES={}
-AUTH_LOCK=threading.Lock()
-DEMO_ACCOUNTS={'student':('student','student123!'),'professor':('professor','professor123!'),'admin':('admin','admin123!')}
-MAX_BODY=20000
-SESSION_AGE=security.SESSION_ABSOLUTE
-security.validate_config()
-
-
+USERS={'student':'student123!','professor':'professor123!','admin':'admin123!'}
+CORPUS=[
+ ('인공지능의 이해 · 머신러닝','머신러닝은 학습 데이터로 패턴을 학습하는 AI 방법입니다. 지도학습은 정답이 있는 데이터에서 학습하고, 비지도학습은 숨겨진 패턴을 찾습니다.'),
+ ('인공지능의 이해 · 딥러닝','딥러닝은 여러 층의 인공신경망을 사용하는 머신러닝의 하위 분야입니다. 이미지, 음성, 언어 처리에 널리 사용됩니다.'),
+ ('디지털 경영전략 · 디지털 전환','디지털 전환은 기술 도입만이 아니라 고객 경험, 업무 프로세스, 데이터 활용, 조직 문화를 함께 바꾸는 전략입니다.'),
+ ('사회복지개론 · 사회복지','사회복지는 개인과 공동체의 삶의 질을 높이기 위한 제도와 실천을 다루며, 복지 서비스의 접근성과 형평성을 강조합니다.'),
+ ('학사 FAQ · 수강신청','시연용 동계학기 수강신청은 학사행정 메뉴에서 가능합니다. 시연용 최대 신청 학점은 9학점이며 과목당 3학점입니다.'),
+ ('학사 FAQ · 증명서','학사행정의 증명서 신청에서 재학증명서, 성적증명서, 수료증명서의 미리보기를 확인할 수 있습니다. 시연 출력물은 공식 증명서가 아닙니다.'),
+ ('학사 FAQ · 졸업','학사행정의 학점·졸업진단 화면에서 예시 취득학점과 잔여학점을 확인할 수 있습니다. 실제 졸업 요건은 학과별 필수학점 등을 별도로 검증해야 합니다.'),
+ ('학습 안내 · 학습 계획','학습 계획은 주간 과제 마감일과 남은 학습 진도를 확인한 후, 진도가 낮은 과목부터 짧은 구간으로 나누어 복습하는 방식으로 세웁니다.'),
+]
 def db_conn():
- con=sqlite3.connect(DB,timeout=15)
- con.row_factory=sqlite3.Row
- con.execute('PRAGMA foreign_keys=ON')
- con.execute('PRAGMA busy_timeout=15000')
- return con
-
+ c=sqlite3.connect(DB,timeout=10);c.row_factory=sqlite3.Row;return c
 
 def setup():
- DB.parent.mkdir(parents=True,exist_ok=True)
  with db_conn() as db:
-  db.execute('PRAGMA journal_mode=WAL')
-  db.execute('CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY,role TEXT NOT NULL,salt TEXT NOT NULL,pw_hash TEXT NOT NULL)')
-  academic.init(db)
-  operations.init(db)
-  security.init(db)
-  sis.init(db)
-  attendance_rules.init(db)
-  for user,(role,password) in (DEMO_ACCOUNTS.items() if security.MODE=='demo' else []):
-   if db.execute('SELECT 1 FROM users WHERE username=?',(user,)).fetchone():continue
-   salt=secrets.token_hex(16)
-   digest=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),250000).hex()
-   db.execute('INSERT INTO users VALUES(?,?,?,?)',(user,role,salt,digest))
+  db.execute('CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, role TEXT NOT NULL, salt TEXT NOT NULL, pw_hash TEXT NOT NULL)')
+  db.execute('CREATE TABLE IF NOT EXISTS student_state (username TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)')
+  db.execute('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, action TEXT, ts INTEGER)')
+  for u,pw in USERS.items():
+   if db.execute('SELECT 1 FROM users WHERE username=?',(u,)).fetchone():continue
+   salt=secrets.token_hex(16);digest=hashlib.pbkdf2_hmac('sha256',pw.encode(),bytes.fromhex(salt),210000).hex()
+   db.execute('INSERT INTO users VALUES(?,?,?,?)',(u,'student' if u=='student' else u,salt,digest))
 
+def search_corpus(question):
+ import re
+ tokens=set(re.findall(r'[a-z]{2,}|[가-힣]{2,}|[\u4e00-\u9fff]{2,}',question.lower()))
+ aliases={'ai':'인공지능','ml':'머신러닝','학점':'졸업','과제':'학습','plan':'학습','learning':'학습','machine':'머신러닝','deep':'딥러닝','graduate':'졸업','certificate':'증명서','registration':'수강신청'}
+ tokens|={aliases[t] for t in list(tokens) if t in aliases}
+ scores=[]
+ for title,body in CORPUS:
+  doc=(title+' '+body).lower();score=sum(4 if t in title.lower() else 1 for t in tokens if t in doc)
+  scores.append((score,title,body))
+ return sorted(scores,reverse=True)[:3]
 
 class Handler(BaseHTTPRequestHandler):
- server_version='SCU-v5-local'
- def log_message(self,*args):pass
- def headers_common(self):
-  self.send_header('X-Content-Type-Options','nosniff')
-  self.send_header('Referrer-Policy','no-referrer')
-  self.send_header('X-Frame-Options','DENY')
-  self.send_header('Cache-Control','no-store')
-  self.send_header('Permissions-Policy','camera=(), microphone=(), geolocation=()')
-  if security.MODE=='production':self.send_header('Strict-Transport-Security','max-age=31536000; includeSubDomains')
-  self.send_header('Content-Security-Policy',"default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; media-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
- def respond(self,status,result,cookie=None):
-  raw=json.dumps(result,ensure_ascii=False).encode()
-  self.send_response(status)
-  self.send_header('Content-Type','application/json; charset=utf-8')
-  self.send_header('Content-Length',str(len(raw)))
-  self.headers_common()
+ server_version='SCU-Demo/2.0'
+ def log_message(self,*args): pass
+ def json(self,code,body,cookie=None):
+  payload=json.dumps(body,ensure_ascii=False).encode('utf-8');self.send_response(code)
+  self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Content-Length',str(len(payload)))
+  self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff')
   if cookie:self.send_header('Set-Cookie',cookie)
-  self.end_headers();self.wfile.write(raw)
- def read_body(self):
-  try:size=int(self.headers.get('Content-Length','0'))
-  except ValueError:raise ValueError('Invalid length')
-  if size<0 or size>MAX_BODY:raise ValueError('Invalid body length')
-  raw=self.rfile.read(size)
-  try:data=json.loads(raw or b'{}')
-  except json.JSONDecodeError:raise ValueError('Invalid JSON')
-  if not isinstance(data,dict):raise ValueError('Object required')
-  return data
- def session_token(self):
-  jar=SimpleCookie()
-  try:jar.load(self.headers.get('Cookie',''))
-  except Exception:return None
-  item=jar.get('__Host-scu_session' if security.MODE=='production' else 'scu_session')
-  return item.value if item else None
+  self.end_headers();self.wfile.write(payload)
+ def body(self):
+  size=int(self.headers.get('Content-Length','0'))
+  if size>50000:raise ValueError('Request too large')
+  return json.loads(self.rfile.read(size) or b'{}')
  def session(self):
-  with db_conn() as db:return security.read_session(db,self.session_token())
- def csrf_token(self,s):
-  return security.csrf_from_session(self.session_token())
- def csrf_ok(self):
-  s=self.session()
-  if not s:return True
-  header=self.headers.get('X-CSRF-Token','')
-  return bool(header and hmac.compare_digest(security.token_digest(header),s['csrf_hash']))
- def tls_ok(self):
-  if security.MODE!='production':return True
-  # Process is bound to 127.0.0.1 only and must run behind a secured, trusted TLS reverse proxy.
-  return self.headers.get('X-Forwarded-Proto','')=='https'
- def redirect(self,url,cookie=None,status=302):
-  self.send_response(status);self.send_header('Location',url)
-  self.headers_common()
-  if cookie:self.send_header('Set-Cookie',cookie)
-  self.send_header('Content-Length','0');self.end_headers()
+  cookie=SimpleCookie()
+  try:cookie.load(self.headers.get('Cookie',''))
+  except:pass
+  tok=cookie.get('scu_session');entry=SESSIONS.get(tok.value) if tok else None
+  if entry and entry['expires']>time.time():return entry
+  return None
  def require(self,roles=None):
-  s=self.session()
-  if not s:self.respond(401,{'error':'Login required'});return None
-  if roles and s['role'] not in roles:self.respond(403,{'error':'Permission denied'});return None
-  return s
- def safe_origin(self):
-  origin=self.headers.get('Origin')
-  host=self.headers.get('Host','')
-  return not origin or origin.rstrip('/') in ('http://'+host,'https://'+host)
+  sess=self.session()
+  if not sess:self.json(401,{'error':'Login required'});return None
+  if roles and sess['role'] not in roles:self.json(403,{'error':'Permission denied'});return None
+  return sess
  def do_GET(self):
-  parsed=urlparse(self.path);path=parsed.path;args=parse_qs(parsed.query)
-  if not self.tls_ok():return self.respond(403,{'error':'HTTPS required'})
-  if path=='/api/health':return self.respond(200,{'status':'ok','version':'v6','mode':security.MODE})
-  if path=='/auth/start':
-   if security.MODE!='production':return self.respond(404,{'error':'OIDC not enabled in demo'})
-   try:
-    with db_conn() as db:url,state=security.begin_oidc(db)
-    return self.redirect(url,f'__Host-scu_oidc={state}; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=300')
-   except Exception:return self.respond(503,{'error':'Identity provider unavailable'})
-  if path=='/auth/callback':
-   if security.MODE!='production':return self.respond(404,{'error':'OIDC not enabled'})
-   try:
-    jar=SimpleCookie();jar.load(self.headers.get('Cookie',''))
-    cookie_state=jar.get('__Host-scu_oidc')
-    state=args.get('state',[''])[0]
-    if not cookie_state or not hmac.compare_digest(cookie_state.value,state):return self.respond(401,{'error':'OIDC browser state mismatch'})
-    with db_conn() as db:
-     username,role,mfa=security.complete_oidc(db,state,args.get('code',[''])[0])
-     token,csrf=security.add_session(db,username,role,'oidc',mfa)
-    return self.redirect('/',security.secure_cookie(token))
-   except Exception:return self.respond(401,{'error':'SSO verification failed or MFA assurance missing'})
+  path=urlparse(self.path).path
+  if path=='/api/health':return self.json(200,{'status':'ok','database':str(DB.name),'mode':'demo'})
   if path=='/api/me':
-   s=self.session();return self.respond(200,{'user':{'username':s['username'],'role':s['role']} if s else None,'csrf_token':s and self.csrf_token(s)})
-  if path=='/api/v5/dashboard':
-   s=self.require(['student']);
-   if not s:return
-   with db_conn() as db:result=operations.summary(db,s['username'])
-   return self.respond(200,result)
-  if path=='/api/v5/lessons':
-   s=self.require(['student']);
-   if not s:return
-   with db_conn() as db:result=operations.lessons(db,s['username'],args.get('course',[''])[0])
-   return self.respond(200,{'lessons':result}) if result is not None else self.respond(403,{'error':'Course enrollment required'})
-  if path=='/api/v5/requests':
-   s=self.require(['student','admin']);
-   if not s:return
-   with db_conn() as db:result=operations.requests(db,s['username'] if s['role']=='student' else None)
-   return self.respond(200,{'requests':result})
-  if path=='/api/v5/materials':
+   s=self.session();return self.json(200,{'user':{'username':s['username'],'role':s['role']} if s else None})
+  if path=='/api/state':
    s=self.require();
    if not s:return
-   with db_conn() as db:result=operations.material_list(db,s['role'],s['username'],args.get('course',[None])[0])
-   return self.respond(200,{'materials':result})
-  if path=='/api/v5/staff':
+   with db_conn() as db:r=db.execute('SELECT payload FROM student_state WHERE username=?',(s['username'],)).fetchone()
+   return self.json(200,{'state':json.loads(r['payload']) if r else None})
+  if path=='/api/stats':
    s=self.require(['professor','admin']);
    if not s:return
    with db_conn() as db:
-    courses=operations.courses(db)
-    if s['role']=='professor':courses=[c for c in courses if c['teacher']==s['username']]
-    rosters={c['code']:operations.course_students(db,c['teacher'],c['code']) for c in courses}
-    result={'courses':courses,'rosters':rosters,'lessons':operations.staff_lessons(db,s['username']) if s['role']=='professor' else [],'requests':operations.requests(db) if s['role']=='admin' else [],'audit':[dict(x) for x in db.execute('SELECT actor,action,subject,ts FROM academic_audit ORDER BY id DESC LIMIT 40').fetchall()] if s['role']=='admin' else []}
-   return self.respond(200,result)
-  if path not in ('/','/index.html') and not path.startswith('/assets/'):
-   self.send_error(404);return
-  filepath=(ROOT / ('index.html' if path=='/' else path.lstrip('/'))).resolve()
-  if not filepath.is_relative_to(ROOT) or not filepath.is_file():self.send_error(404);return
-  mime=mimetypes.guess_type(filepath.name)[0] or 'application/octet-stream'
-  raw=filepath.read_bytes()
-  self.send_response(200);self.send_header('Content-Type',mime+('; charset=utf-8' if mime in ('text/html','text/css','application/javascript') else ''))
-  self.send_header('Content-Length',str(len(raw)));self.headers_common();self.end_headers();self.wfile.write(raw)
+    rows=db.execute('SELECT username,payload,updated_at FROM student_state').fetchall()
+    audit=db.execute('SELECT username,action,ts FROM audit ORDER BY id DESC LIMIT 15').fetchall()
+   overview=[{'username':r['username'],'completed':len(json.loads(r['payload']).get('completed',[])),'registered':len(json.loads(r['payload']).get('registered',[])),'updated_at':r['updated_at']} for r in rows]
+   return self.json(200,{'learners':overview,'audit':[dict(x) for x in audit] if s['role']=='admin' else []})
+  file=ROOT/('index.html' if path=='/' else path.lstrip('/'))
+  if not file.resolve().is_relative_to(ROOT) or not file.is_file():self.send_error(404);return
+  mime=mimetypes.guess_type(file.name)[0] or 'application/octet-stream';data=file.read_bytes()
+  self.send_response(200);self.send_header('Content-Type',mime+('; charset=utf-8' if mime.startswith('text/') or mime=='application/javascript' else ''))
+  self.send_header('Content-Length',str(len(data)));self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(data)
  def do_POST(self):
   path=urlparse(self.path).path
-  if not self.tls_ok():return self.respond(403,{'error':'HTTPS required'})
-  if path=='/api/sis/webhook':
-   try:
-    n=int(self.headers.get('Content-Length','0'))
-    if n<1 or n>65536:return self.respond(413,{'error':'Invalid payload length'})
-    raw=self.rfile.read(n)
-    with db_conn() as db:status,result=sis.inbound(db,raw,self.headers.get('X-SIS-Signature',''),self.headers.get('X-SIS-Timestamp',''))
-    return self.respond(status,result)
-   except Exception:return self.respond(400,{'error':'Webhook processing failed'})
-  if security.MODE=='production' and path=='/api/login':return self.respond(403,{'error':'Local login disabled: use campus SSO'})
-  if path not in ('/api/login',) and not self.csrf_ok():return self.respond(403,{'error':'Invalid or missing CSRF token'})
-  if not self.safe_origin():return self.respond(403,{'error':'Origin rejected'})
-  if self.headers.get('Content-Type','').split(';',1)[0].strip()!='application/json':return self.respond(415,{'error':'JSON required'})
-  try:data=self.read_body()
-  except ValueError as e:return self.respond(400,{'error':str(e)})
+  try:data=self.body()
+  except (ValueError,json.JSONDecodeError):return self.json(400,{'error':'Invalid request'})
   if path=='/api/login':
-   user=str(data.get('username',''))[:50];password=str(data.get('password',''))[:256]
-   key=(self.client_address[0],user);now=time.time()
-   with AUTH_LOCK:
-    hits=[x for x in LOGIN_FAILURES.get(key,[]) if now-x<300]
-    LOGIN_FAILURES[key]=hits
-    if len(hits)>=5:return self.respond(429,{'error':'Too many failed attempts; try again later'})
-   with db_conn() as db:r=db.execute('SELECT * FROM users WHERE username=?',(user,)).fetchone()
-   if r:
-    digest=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(r['salt']),250000).hex()
-    valid=hmac.compare_digest(digest,r['pw_hash'])
-   else:
-    hashlib.pbkdf2_hmac('sha256',password.encode(),b'0'*16,250000)
-    valid=False
-   if not valid:
-    with AUTH_LOCK:LOGIN_FAILURES.setdefault(key,[]).append(now)
-    return self.respond(401,{'error':'Invalid credentials'})
-   with db_conn() as db:token,csrf=security.add_session(db,user,r['role'],'demo',False)
-   with AUTH_LOCK:LOGIN_FAILURES.pop(key,None)
-   return self.respond(200,{'user':{'username':user,'role':r['role']},'csrf_token':csrf},security.secure_cookie(token))
+   name=str(data.get('username',''))[:50];password=str(data.get('password',''))
+   with db_conn() as db:r=db.execute('SELECT * FROM users WHERE username=?',(name,)).fetchone()
+   if not r:return self.json(401,{'error':'Invalid credentials'})
+   digest=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(r['salt']),210000).hex()
+   if not hmac.compare_digest(digest,r['pw_hash']):return self.json(401,{'error':'Invalid credentials'})
+   tok=secrets.token_urlsafe(32);SESSIONS[tok]={'username':name,'role':r['role'],'expires':time.time()+8*3600}
+   return self.json(200,{'user':{'username':name,'role':r['role']}},f'scu_session={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800')
   if path=='/api/logout':
-   with db_conn() as db:security.remove_session(db,self.session_token())
-   return self.respond(200,{'ok':True},security.secure_cookie('',0))
-  if path=='/api/v6/policy':
-   s=self.require(['admin'])
+   cookie=SimpleCookie();cookie.load(self.headers.get('Cookie',''))
+   if cookie.get('scu_session'):SESSIONS.pop(cookie['scu_session'].value,None)
+   return self.json(200,{'ok':True},'scu_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0')
+  if path=='/api/state':
+   s=self.require(['student']);
    if not s:return
-   if security.MODE=='production' and not s['mfa']:return self.respond(403,{'error':'MFA required'})
-   with db_conn() as db:code,result=attendance_rules.publish(db,data.get('term'),data.get('course'),data.get('version'),data.get('rule'),s['username'])
-   return self.respond(code,result)
-  if path.startswith('/api/v5/'):
+   new=data.get('state')
+   if not isinstance(new,dict):return self.json(400,{'error':'State must be an object'})
+   allowed=('completed','registered','certs','requests','messages','lang','senior','tab','course','lesson')
+   clean={k:new[k] for k in allowed if k in new}
+   if not isinstance(clean.get('completed',[]),list) or not isinstance(clean.get('registered',[]),list):return self.json(400,{'error':'Invalid data'})
+   if len(json.dumps(clean))>30000:return self.json(413,{'error':'State too large'})
+   now=int(time.time())
+   with db_conn() as db:
+    db.execute('INSERT INTO student_state VALUES(?,?,?) ON CONFLICT(username) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at',(s['username'],json.dumps(clean,ensure_ascii=False),now))
+    db.execute('INSERT INTO audit(username,action,ts) VALUES(?,?,?)',(s['username'],'save_state',now))
+   return self.json(200,{'ok':True,'saved_at':now})
+  if path=='/api/tutor':
    s=self.require();
    if not s:return
-   allowed={'/api/v5/registration':'student','/api/v5/request':'student','/api/v5/video/start':'student','/api/v5/video/progress':'student','/api/v5/decision':'admin','/api/v5/material':'professor','/api/v5/lesson':'professor'}
-   if path!='/api/v5/tutor' and path not in allowed:return self.respond(404,{'error':'Unknown endpoint'})
-   if security.MODE=='production' and path in ('/api/v5/decision','/api/v5/material','/api/v5/lesson') and not s['mfa']:return self.respond(403,{'error':'MFA required'})
-   if path in allowed and s['role']!=allowed[path]:return self.respond(403,{'error':'Permission denied'})
-   with db_conn() as db:
-    if path=='/api/v5/registration':
-     code,result=academic.enrollment(db,s['username'],str(data.get('course','')),str(data.get('operation','')))
-     if code==200:result['dashboard']=operations.summary(db,s['username'])
-    elif path=='/api/v5/request':code,result=academic.create_request(db,s['username'],data.get('type'),data.get('note'))
-    elif path=='/api/v5/decision':code,result=operations.approve(db,s['username'],data.get('id'),data.get('decision'),data.get('comment'))
-    elif path=='/api/v5/material':code,result=operations.material_write(db,s['username'],data)
-    elif path=='/api/v5/lesson':code,result=operations.lesson_write(db,s['username'],data)
-    elif path=='/api/v5/video/start':code,result=academic.start(db,s['username'],str(data.get('course','')),data.get('lesson'))
-    elif path=='/api/v5/video/progress':
-     code,result=academic.heartbeat(db,s['username'],str(data.get('session_id','')),data.get('position'),data.get('ended') is True)
-     if code==200:result['dashboard']=operations.summary(db,s['username'])
-    elif path=='/api/v5/tutor':
-     q=data.get('question','');course=data.get('course')
-     if not isinstance(q,str) or not 2<=len(q.strip())<=500:return self.respond(400,{'error':'Question must contain 2-500 characters'})
-     if course is not None and not isinstance(course,str):return self.respond(400,{'error':'Invalid course'})
-     code,result=200,operations.retrieve(db,s['role'],s['username'],q,course)
-    else:code,result=404,{'error':'Unknown endpoint'}
-   return self.respond(code,result)
-  return self.respond(404,{'error':'Not found'})
+   q=str(data.get('question','')).strip()[:500]
+   if not q:return self.json(400,{'error':'Question missing'})
+   hits=[{'title':title,'excerpt':body} for score,title,body in search_corpus(q) if score>0][:2]
+   if not hits:return self.json(200,{'answer':'제공된 교안과 학사 FAQ에서 관련 근거를 찾지 못했습니다. 질문을 구체화하거나 담당 교수에게 문의해 주세요.','sources':[],'mode':'retrieval'})
+   answer='\n'.join(x['excerpt'] for x in hits)
+   if os.getenv('OPENAI_API_KEY'):
+    try:
+     req=urllib.request.Request('https://api.openai.com/v1/responses',data=json.dumps({'model':os.getenv('SCU_AI_MODEL','gpt-4.1-mini'),'input':[{'role':'system','content':'너는 사이버대학교 학습 도우미다. 제공된 교안만 근거로 200자 이내의 한국어 답변을 한다. 근거가 없으면 모른다고 답한다. 개인정보와 공식 학사 승인에 대한 결정을 하지 않는다.'},{'role':'user','content':'근거: '+answer+'\n질문: '+q}]}).encode(),headers={'Authorization':'Bearer '+os.environ['OPENAI_API_KEY'],'Content-Type':'application/json'},method='POST')
+     with urllib.request.urlopen(req,timeout=12) as resp:r=json.load(resp)
+     parts=[z.get('text','') for item in r.get('output',[]) for z in item.get('content',[]) if z.get('type')=='output_text']
+     if parts:answer=' '.join(parts);mode='openai-rag'
+     else:mode='retrieval'
+    except Exception:mode='retrieval'
+   else:mode='retrieval'
+   return self.json(200,{'answer':answer,'sources':[{'title':x['title']} for x in hits],'mode':mode})
+  return self.json(404,{'error':'Not found'})
 
 if __name__=='__main__':
- setup()
- port=int(os.getenv('PORT','8765'))
- print(f'Campus OS v6 {security.MODE} — bind 127.0.0.1:{port}; DB={DB}',flush=True)
+ setup();port=int(os.getenv('PORT','8765'))
+ print(f'Campus demo http://127.0.0.1:{port}  DB={DB}',flush=True)
  ThreadingHTTPServer(('127.0.0.1',port),Handler).serve_forever()
