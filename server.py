@@ -1,5 +1,6 @@
 """Smart Cyber University demo server: stdlib-only, local development ONLY."""
 import json, os, sqlite3, secrets, hashlib, hmac, time, mimetypes, urllib.request
+import academic
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from http.cookies import SimpleCookie
@@ -27,6 +28,7 @@ def setup():
   db.execute('CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, role TEXT NOT NULL, salt TEXT NOT NULL, pw_hash TEXT NOT NULL)')
   db.execute('CREATE TABLE IF NOT EXISTS student_state (username TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)')
   db.execute('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, action TEXT, ts INTEGER)')
+  academic.init(db)
   for u,pw in USERS.items():
    if db.execute('SELECT 1 FROM users WHERE username=?',(u,)).fetchone():continue
    salt=secrets.token_hex(16);digest=hashlib.pbkdf2_hmac('sha256',pw.encode(),bytes.fromhex(salt),210000).hex()
@@ -49,7 +51,7 @@ class Handler(BaseHTTPRequestHandler):
  def json(self,code,body,cookie=None):
   payload=json.dumps(body,ensure_ascii=False).encode('utf-8');self.send_response(code)
   self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Content-Length',str(len(payload)))
-  self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff')
+  self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Referrer-Policy','no-referrer')
   if cookie:self.send_header('Set-Cookie',cookie)
   self.end_headers();self.wfile.write(payload)
  def body(self):
@@ -70,7 +72,25 @@ class Handler(BaseHTTPRequestHandler):
   return sess
  def do_GET(self):
   path=urlparse(self.path).path
-  if path=='/api/health':return self.json(200,{'status':'ok','database':str(DB.name),'mode':'demo'})
+  if path=='/api/health':return self.json(200,{'status':'ok','database':str(DB.name),'mode':'demo','version':'v3'})
+  if path=='/api/v3/catalog':
+   s=self.require();
+   if not s:return
+   with db_conn() as db:rows=academic.catalog(db,s['username'] if s['role']=='student' else None)
+   return self.json(200,{'courses':rows,'policy':academic.POLICY})
+  if path=='/api/v3/attendance':
+   s=self.require(['student']);
+   if not s:return
+   with db_conn() as db:rows=academic.attendances(db,s['username'])
+   return self.json(200,{'attendance':rows,'official':False})
+  if path=='/api/v3/overview':
+   s=self.require(['professor','admin']);
+   if not s:return
+   with db_conn() as db:
+    query='SELECT a.student,a.course,a.lesson,a.recognized_at FROM attendance a JOIN academic_courses c ON c.code=a.course'
+    rows=db.execute(query+(' WHERE c.teacher=?' if s['role']=='professor' else '')+' ORDER BY a.recognized_at DESC LIMIT 100', (s['username'],) if s['role']=='professor' else ()).fetchall()
+    audits=db.execute('SELECT actor,action,subject,ts FROM academic_audit ORDER BY id DESC LIMIT 30').fetchall() if s['role']=='admin' else []
+   return self.json(200,{'attendance':[dict(r) for r in rows],'audit':[dict(r) for r in audits]})
   if path=='/api/me':
    s=self.session();return self.json(200,{'user':{'username':s['username'],'role':s['role']} if s else None})
   if path=='/api/state':
@@ -86,6 +106,9 @@ class Handler(BaseHTTPRequestHandler):
     audit=db.execute('SELECT username,action,ts FROM audit ORDER BY id DESC LIMIT 15').fetchall()
    overview=[{'username':r['username'],'completed':len(json.loads(r['payload']).get('completed',[])),'registered':len(json.loads(r['payload']).get('registered',[])),'updated_at':r['updated_at']} for r in rows]
    return self.json(200,{'learners':overview,'audit':[dict(x) for x in audit] if s['role']=='admin' else []})
+  # Do not expose source files, SQLite databases, credentials or README through HTTP.
+  if path not in ('/','/index.html') and not path.startswith('/assets/'):
+   self.send_error(404);return
   file=ROOT/('index.html' if path=='/' else path.lstrip('/'))
   if not file.resolve().is_relative_to(ROOT) or not file.is_file():self.send_error(404);return
   mime=mimetypes.guess_type(file.name)[0] or 'application/octet-stream';data=file.read_bytes()
@@ -93,8 +116,25 @@ class Handler(BaseHTTPRequestHandler):
   self.send_header('Content-Length',str(len(data)));self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(data)
  def do_POST(self):
   path=urlparse(self.path).path
+  origin=self.headers.get('Origin')
+  if origin and origin.rstrip('/') not in ('http://'+self.headers.get('Host',''), 'https://'+self.headers.get('Host','')):
+   return self.json(403,{'error':'Origin rejected'})
   try:data=self.body()
   except (ValueError,json.JSONDecodeError):return self.json(400,{'error':'Invalid request'})
+  if path.startswith('/api/v3/'):
+   s=self.require(['student']);
+   if not s:return
+   with db_conn() as db:
+    if path=='/api/v3/enrollment':
+     status,result=academic.enrollment(db,s['username'],str(data.get('course','')),str(data.get('operation','')))
+    elif path=='/api/v3/video/start':
+     status,result=academic.start(db,s['username'],str(data.get('course','')),data.get('lesson'))
+    elif path=='/api/v3/video/progress':
+     status,result=academic.heartbeat(db,s['username'],str(data.get('session_id','')),data.get('position'),data.get('ended') is True)
+    elif path=='/api/v3/requests':
+     status,result=academic.create_request(db,s['username'],data.get('type'),data.get('note'))
+    else:status,result=404,{'error':'Not found'}
+   return self.json(status,result)
   if path=='/api/login':
    name=str(data.get('username',''))[:50];password=str(data.get('password',''))
    with db_conn() as db:r=db.execute('SELECT * FROM users WHERE username=?',(name,)).fetchone()
@@ -143,5 +183,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__=='__main__':
  setup();port=int(os.getenv('PORT','8765'))
- print(f'Campus demo http://127.0.0.1:{port}  DB={DB}',flush=True)
+ print(f'Campus v3 demo http://127.0.0.1:{port}  DB={DB}',flush=True)
  ThreadingHTTPServer(('127.0.0.1',port),Handler).serve_forever()

@@ -1,8 +1,7 @@
 """Normalized academic records and attendance-policy proof of concept.
 All records are synthetic; NOT an accredited attendance or registrar system.
 """
-import json, sqlite3, secrets, time, os
-import attendance_rules
+import json, sqlite3, secrets, time
 
 COURSES = [
  ('AI101','인공지능의 이해',3,'professor'),
@@ -23,9 +22,6 @@ def init(db):
  CREATE TABLE IF NOT EXISTS academic_audit (id INTEGER PRIMARY KEY AUTOINCREMENT,actor TEXT NOT NULL,action TEXT NOT NULL,subject TEXT NOT NULL,ts INTEGER NOT NULL);
  ''')
  db.executemany('INSERT OR IGNORE INTO academic_courses VALUES (?,?,?,?)',COURSES)
- cols=[r[1] for r in db.execute('PRAGMA table_info(video_sessions)')]
- if 'policy_json' not in cols:db.execute('ALTER TABLE video_sessions ADD COLUMN policy_json TEXT')
- if 'duration_seconds' not in cols:db.execute('ALTER TABLE video_sessions ADD COLUMN duration_seconds INTEGER')
  # Synthetic initial enrollment for LMS demonstration; no registration decisions made here.
  now=int(time.time())
  db.executemany('INSERT OR IGNORE INTO enrollments VALUES (?,?,?)',[('student',c,now) for c in ['AI101','BUS201','SOC110']])
@@ -59,36 +55,29 @@ def enrollment(db, student, course, operation):
 def start(db,student,course,lesson):
  if not isinstance(lesson,int) or isinstance(lesson,bool) or not (0<=lesson<6):return 400,{'error':'Invalid lesson'}
  if not db.execute('SELECT 1 FROM enrollments WHERE student=? AND course=?',(student,course)).fetchone():return 403,{'error':'Course enrollment required'}
- if not db.execute('SELECT 1 FROM lessons WHERE course=? AND lesson=? AND active=1',(course,lesson)).fetchone():return 403,{'error':'Lesson is unpublished or unavailable'}
- policy=attendance_rules.get(db,course)
- if not policy:return 409,{'error':'No approved attendance policy for this course and term'}
- item=db.execute('SELECT duration_seconds FROM lessons WHERE course=? AND lesson=?',(course,lesson)).fetchone()
- duration=item['duration_seconds']
- if not duration or duration<1:return 409,{'error':'Invalid lesson duration'}
  sid=secrets.token_urlsafe(24);now=time.time()
- with db:db.execute('INSERT INTO video_sessions(id,student,course,lesson,started_at,last_at,policy_json,duration_seconds) VALUES (?,?,?,?,?,?,?,?)',(sid,student,course,lesson,now,now,json.dumps(policy),duration))
- return 200,{'session_id':sid,'policy':policy,'duration_seconds':duration,'course':course,'lesson':lesson}
+ with db:db.execute('INSERT INTO video_sessions(id,student,course,lesson,started_at,last_at) VALUES (?,?,?,?,?,?)',(sid,student,course,lesson,now,now))
+ return 200,{'session_id':sid,'policy':POLICY,'course':course,'lesson':lesson}
 
 def heartbeat(db,student,sid,position,ended=False):
  if not isinstance(position,(float,int)) or isinstance(position,bool):return 400,{'error':'Invalid position'}
  row=db.execute('SELECT * FROM video_sessions WHERE id=? AND student=?',(sid,student)).fetchone()
  if not row:return 404,{'error':'Unknown session'}
  if row['closed']:return 409,{'error':'Session closed'}
- now=time.time();policy=json.loads(row['policy_json']) if row['policy_json'] else POLICY
- duration=row['duration_seconds'] or POLICY['video_duration_seconds'];pos=float(position)
+ now=time.time();duration=POLICY['video_duration_seconds'];pos=float(position)
  if pos<0 or pos>duration+.5:return 400,{'error':'Position out of range'}
  elapsed=max(0,now-row['last_at']);delta=max(0,pos-row['last_position'])
  # Seek-ahead does not earn time. Progress over the elapsed wall-clock time is bounded.
- earned=min(delta,elapsed*policy.get('max_speed',1)+policy.get('heartbeat_grace_seconds',0.5))
+ earned=min(delta,elapsed+0.5)
  # A long idle tab cannot accumulate attendance if player did not move.
  total=min(duration,row['credited_seconds']+earned)
- ratio=total/duration;eligible=total>=policy['min_watch_seconds'] and ratio>=policy['min_watch_ratio']
+ ratio=total/duration;eligible=total>=POLICY['min_watch_seconds'] and ratio>=POLICY['min_watch_ratio']
  with db:
   db.execute('UPDATE video_sessions SET last_at=?,last_position=?,credited_seconds=?,closed=? WHERE id=?',(now,pos,total,int(bool(ended)),sid))
-  if ended and eligible and policy.get('require_ended',True):
-   db.execute('INSERT OR IGNORE INTO attendance VALUES (?,?,?,?,?,?)',(student,row['course'],row['lesson'],int(now),round(ratio,3),policy.get('version','legacy-v5')))
+  if ended and eligible:
+   db.execute('INSERT OR IGNORE INTO attendance VALUES (?,?,?,?,?,?)',(student,row['course'],row['lesson'],int(now),round(ratio,3),'demo-v1'))
    audit(db,student,'demo_attendance_recognized',row['course']+':'+str(row['lesson']))
- return 200,{'credited_seconds':round(total,2),'ratio':round(ratio,3),'eligible':eligible,'recognized':bool(ended and eligible),'policy_version':policy.get('version','legacy-v5'),'policy':'Pilot evidence only — subject to institution rules and human verification'}
+ return 200,{'credited_seconds':round(total,2),'ratio':round(ratio,3),'eligible':eligible,'recognized':bool(ended and eligible),'policy':'DEMO ONLY — not official attendance'}
 
 def create_request(db,student,kind,note):
  if kind not in ('leave','return','major_change'):return 400,{'error':'Unsupported request type'}
